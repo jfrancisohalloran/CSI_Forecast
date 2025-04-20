@@ -1,0 +1,549 @@
+import os
+import re
+import math
+import pandas as pd
+import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import BDay, CustomBusinessDay
+
+import numpy as np
+import logging
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+import seaborn as sns
+import streamlit as st
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+import joblib
+import statsmodels.api as sm
+
+import keras
+from keras.models import Sequential, load_model
+from keras.layers import Dense, Dropout, LSTM
+from keras.wrappers.scikit_learn import KerasRegressor
+from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+
+from pandas.tseries.holiday import USFederalHolidayCalendar
+import shap
+
+import random
+import numpy as np
+import tensorflow as tf
+
+from statsmodels.graphics.tsaplots import plot_acf
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="DataFrameGroupBy.apply operated on the grouping columns"
+)
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATE_COL_PATTERN = re.compile(r"^[A-Z][a-z]{2}\s+\d{2}$")
+TIME_CHILD_ROOM_PATTERN = re.compile(r"(\d{1,2}:\d{2}\s?(?:AM|PM))\s*\((.*?)\)(?:\s*\[(.*?)\])?")
+
+logfile = f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
+
+logging.basicConfig(
+    filename=logfile,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+def extract_year_from_filename(filename):
+    match = re.search(r'(20\d{2})', filename)
+    return match.group(1) if match else None
+
+def parse_event(cell_text):
+    if not isinstance(cell_text, str):
+        return []
+    lines = cell_text.split('\n')
+    events = []
+    for line in lines:
+        matches = TIME_CHILD_ROOM_PATTERN.findall(line)
+        for (time_str, teacher, event_room) in matches:
+            events.append((time_str.strip(), teacher.strip(), event_room.strip()))
+    return events
+
+def combine_date_time(date_obj, time_str):
+    if date_obj is None or not isinstance(time_str, str):
+        return pd.NaT
+    dt_str = date_obj.strftime("%Y-%m-%d") + " " + time_str
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %I:%M %p")
+    except Exception:
+        return pd.NaT
+
+def get_level_from_room(assigned_room, place):
+    if not assigned_room:
+        return None
+    if place == "ECEC":
+        match = re.search(r"(Infant|Toddlers?|Multi[-\s]?Age|Preschool|Pre[-\s]?K)", assigned_room, re.IGNORECASE)
+        if match:
+            level = match.group(1).title()
+            if "Toddler" in level:
+                return "Toddler"
+            elif "Infant" in level:
+                return "Infant"
+            elif "Multi" in level:
+                return "Multi-Age"
+            elif "Preschool" in level:
+                return "Preschool"
+            elif "Pre" in level:
+                return "Pre-K"
+        return None
+    else:
+        spellman_mapping = {
+            "Good Night Moon": "Infant",
+            "House of Pooh": "Infant",
+            "Panda Bear": "Toddler",
+            "Pandas": "Toddler",
+            "Rabbits": "Toddler",
+            "Monkeys": "Toddler",
+            "Caterpillars": "Multi-Age",
+            "Llama Llama": "Multi-Age",
+            "Llamas Llamas": "Multi-Age",
+            "Wild Things": "Preschool",
+            "Rainbow Fish": "Preschool",
+            "Dinosaurs": "Pre-K",
+            "Dinosaur Stomp": "Pre-K"
+        }
+        if assigned_room in spellman_mapping:
+            return spellman_mapping[assigned_room]
+        match = re.search(r"(Infant|Toddlers?|Multi[-\s]?Age|Preschool|Pre[-\s]?K)", assigned_room, re.IGNORECASE)
+        if match:
+            level = match.group(1).title()
+            if "Toddler" in level:
+                return "Toddler"
+            elif "Infant" in level:
+                return "Infant"
+            elif "Multi" in level:
+                return "Multi-Age"
+            elif "Preschool" in level:
+                return "Preschool"
+            elif "Pre" in level:
+                return "Pre-K"
+        return None
+
+def parse_and_aggregate_attendance():
+    output_excel = os.path.join(BASE_DIR, "Grouped_Staff_Requirements.xlsx")
+    if os.path.exists(output_excel):
+        return pd.read_excel(output_excel)
+    
+    file_names = [
+        "ECEC 2022 Student Sign In and Out.xlsx",
+        "ECEC 2023 Student Sign In and Out.xlsx",
+        "ECEC 2024 Student Sign In and Out.xlsx",
+        "ECEC 2025 01012025-02282025 Student Sign In and Out.xlsx",
+        "Spellman CDC 2022 Student Sign in and out.xlsx",
+        "Spellman CDC 2023 Student Sign in and out.xlsx",
+        "Spellman CDC 2024 Student Sign in and out.xlsx",
+        "Spellman CDC 2025 01012025-02282025 Student Sign in and out.xlsx"
+    ]
+    excel_paths = [os.path.join(BASE_DIR, fn) for fn in file_names]
+    
+    def parse_file_pairs(filepath):
+        df = pd.read_excel(filepath, header=5, dtype=str)
+        basename = os.path.basename(filepath)
+        file_year = extract_year_from_filename(basename)
+        if "Spellman" in basename:
+            place = "Spellman"
+        elif "ECEC" in basename:
+            place = "ECEC"
+        else:
+            place = None
+
+        df = df.rename(columns={"Record ID": "StudentID", "Room": "AssignedRoom"})
+        data_cols = df.columns[7:]
+        paired = []
+        i = 0
+        while i < len(data_cols) - 1:
+            col_in = str(data_cols[i]).strip()
+            if DATE_COL_PATTERN.match(col_in):
+                paired.append((col_in, data_cols[i+1]))
+                i += 2
+            else:
+                i += 1
+        rows = []
+        for sign_in_col, sign_out_col in paired:
+            full_date_str = f"{sign_in_col} {file_year}"
+            try:
+                date_obj = datetime.strptime(full_date_str, "%b %d %Y")
+            except Exception:
+                date_obj = None
+            for idx, row_data in df.iterrows():
+                cell_in = row_data.get(sign_in_col, "")
+                cell_out = row_data.get(sign_out_col, "")
+                parsed_in = parse_event(cell_in)
+                parsed_out = parse_event(cell_out)
+                if parsed_in and parsed_out:
+                    time_in, teacher_in, event_room_in = parsed_in[0]
+                    time_out, teacher_out, _ = parsed_out[0]
+                    dt_in = combine_date_time(date_obj, time_in)
+                    dt_out = combine_date_time(date_obj, time_out)
+                    if pd.notna(dt_in) and pd.notna(dt_out):
+                        duration = (dt_out - dt_in).total_seconds() / 3600
+                        room_extracted = event_room_in if place == "ECEC" else row_data.get("AssignedRoom", "")
+                        rows.append({
+                            "StudentID": row_data.get("StudentID", ""),
+                            "AssignedRoom": room_extracted,
+                            "Tags": row_data.get("Tags", ""),
+                            "Date": date_obj,
+                            "DurationHours": duration,
+                            "Year": file_year,
+                            "Place": place,
+                            "SourceFile": basename
+                        })
+        df_pairs = pd.DataFrame(rows)
+        if df_pairs.empty:
+            return df_pairs
+        grouped_students = df_pairs.groupby(
+            ["StudentID", "Date", "AssignedRoom", "Tags", "Year", "Place", "SourceFile"],
+            as_index=False
+        )["DurationHours"].sum()
+        return grouped_students
+
+    all_dfs = []
+    for path in excel_paths:
+        df_file = parse_file_pairs(path)
+        all_dfs.append(df_file)
+    if not all_dfs:
+        return pd.DataFrame()
+    
+    combined_pairs = pd.concat(all_dfs, ignore_index=True)
+    if combined_pairs.empty:
+        return pd.DataFrame()
+
+    student_daily = combined_pairs.groupby(
+        ["Year", "Place", "Date", "AssignedRoom"],
+        as_index=False
+    ).agg(
+        TotalDurationHours=("DurationHours", "sum"),
+        StudentCount=("StudentID", "nunique")
+    )
+    student_daily["FTE_Students"] = student_daily["TotalDurationHours"] / 9
+    student_daily["Level"] = student_daily.apply(lambda row: get_level_from_room(row["AssignedRoom"], row["Place"]), axis=1)
+    level_ratio = {"Infant": 4, "Multi-Age": 4, "Toddler": 6, "Preschool": 10, "Pre-K": 12}
+    student_daily["StaffRatio"] = student_daily["Level"].map(level_ratio)
+    student_daily["StaffRequired"] = student_daily.apply(
+        lambda row: math.ceil(row["FTE_Students"] / row["StaffRatio"]) if pd.notna(row["StaffRatio"]) and row["StaffRatio"] > 0 else None,
+        axis=1
+    )
+    student_daily.to_excel(output_excel, index=False)
+    return student_daily
+
+def create_dnn(u1=128, u2=64, lr=0.001):
+    model = Sequential([
+        Dense(u1, activation='relu', input_dim=input_dim),
+        Dropout(0.2),
+        Dense(u2, activation='relu'),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(lr), loss='mae')
+    return model
+
+def hyperparameter_search(X_train, y_train):
+    tscv = TimeSeriesSplit(n_splits=3)
+    results = {}
+
+    rf_params = {
+        'n_estimators': [50,100,200],
+        'max_depth': [None,10,20],
+        'min_samples_split': [2,5]
+    }
+    rf_search = RandomizedSearchCV(
+        RandomForestRegressor(), rf_params,
+        n_iter=10, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=-1
+    ).fit(X_train, y_train)
+    results['rf'] = rf_search
+
+    xgb_params = {
+        'n_estimators': [50,100,200],
+        'learning_rate': [0.01,0.1,0.2],
+        'max_depth': [3,6,9]
+    }
+    xgb_search = RandomizedSearchCV(
+        XGBRegressor(objective='reg:squarederror'), xgb_params,
+        n_iter=10, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1
+    ).fit(X_train, y_train)
+    results['xgb'] = xgb_search
+
+    global input_dim
+    input_dim = X_train.shape[1]
+    keras_reg = KerasRegressor(build_fn=create_dnn, epochs=20, batch_size=16, verbose=0)
+    dnn_params = {
+        'u1': [64,128], 'u2': [32,64], 'lr': [0.001,0.01]
+    }
+    dnn_search = RandomizedSearchCV(keras_reg, dnn_params, n_iter=5, cv=tscv, scoring='neg_mean_absolute_error')
+    dnn_search.fit(X_train, y_train)
+    results['dnn'] = dnn_search
+
+    return results
+
+def rolling_errors(model, X, y, window=5):
+    preds = model.predict(X)
+    errors = np.abs(y - preds)
+    rolling_mae = pd.Series(errors).rolling(window).mean()
+
+def explain_tree(model, X):
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    shap.summary_plot(shap_values, X)
+
+def evaluate_and_diagnose(model, X_test, y_test, model_name="Model"):
+    preds = model.predict(X_test)
+    preds = np.array(preds).ravel()
+    errors = y_test - preds
+    
+    mae = mean_absolute_error(y_test, preds)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    logger.info(f"{model_name} MAE: {mae:.3f}, RMSE: {rmse:.3f}")
+
+    rolling_mae = pd.Series(np.abs(errors)).rolling(7, min_periods=1).mean()
+
+    logger.info(f"{model_name} Rolling MAE (7‑window) — last: {rolling_mae.iloc[-1]:.3f}, "
+                f"mean: {rolling_mae.mean():.3f}, max: {rolling_mae.max():.3f}")
+    
+    rolling_mae.to_csv(f"{model_name}_rolling_mae.csv", index=False)
+    
+    from statsmodels.tsa.stattools import acf
+    acf_vals = acf(errors, nlags=10)
+    logger.info(f"{model_name} ACF[0..10]: {acf_vals.tolist()}")
+
+def build_features(df: pd.DataFrame):
+    df = df.sort_values('Date').copy()
+
+    df['dow'] = df['Date'].dt.weekday
+    df['month'] = df['Date'].dt.month
+    df['is_weekend'] = (df['dow'] >= 5).astype(int)
+    cal = USFederalHolidayCalendar()
+    holidays = cal.holidays(start=df['Date'].min(), end=df['Date'].max())
+    df['is_holiday'] = df['Date'].isin(holidays).astype(int)
+
+    df = df.groupby(['Place','AssignedRoom'], group_keys=False).apply(
+      lambda g: g.assign(
+        lag_1        = g['TotalDurationHours'].shift(1),
+        lag_7        = g['TotalDurationHours'].shift(7),
+        lag_30       = g['TotalDurationHours'].shift(30),
+        roll_mean_7  = g['TotalDurationHours'].shift(1).rolling(7).mean(),
+        roll_std_7   = g['TotalDurationHours'].shift(1).rolling(7).std(),
+        roll_mean_30 = g['TotalDurationHours'].shift(1).rolling(30).mean(),
+        roll_std_30  = g['TotalDurationHours'].shift(1).rolling(30).std()
+        )
+    ).reset_index(drop=True)
+
+    df['level_mean_day'] = df.groupby(['Date','Level'])['TotalDurationHours'].transform('mean')
+    df['level_sum_day']  = df.groupby(['Date','Level'])['TotalDurationHours'].transform('sum')
+
+    df.fillna(0, inplace=True)
+
+    ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+    cat_df = df[['Place','Level','AssignedRoom']].astype(str)
+    cat = ohe.fit_transform(cat_df)
+
+    num_cols = [
+        'dow','month','is_weekend','is_holiday',
+        'lag_1','lag_7','lag_30',
+        'roll_mean_7','roll_std_7','roll_mean_30','roll_std_30',
+        'level_mean_day','level_sum_day'
+    ]
+    scaler = StandardScaler()
+    num = scaler.fit_transform(df[num_cols])
+
+    X = np.hstack([cat, num])
+    y = df['TotalDurationHours'].values
+
+    joblib.dump(ohe, 'ohe.pkl')
+    joblib.dump(scaler, 'scaler.pkl')
+
+    return X, y
+
+def evaluate_and_diagnose(model, X_test, y_test, model_name="Model"):
+    y_pred = model.predict(X_test)
+    residuals = y_test - y_pred
+
+    print(f"{model_name} MAE:  {mean_absolute_error(y_test, y_pred):.3f}")
+    print(f"{model_name} RMSE: {np.sqrt(mean_squared_error(y_test, y_pred)):.3f}")
+
+def main():
+    today = pd.to_datetime(datetime.now().date())
+    next_week_dates = pd.date_range(today + pd.Timedelta(days=1), periods=7, freq='D')
+    df = parse_and_aggregate_attendance()
+
+    level_ratio = {
+        "Infant":    4,
+        "Multi-Age": 4,
+        "Toddler":   6,
+        "Preschool": 10,
+        "Pre-K":     12
+    }
+
+    cal = USFederalHolidayCalendar()
+    holidays = cal.holidays(
+        start=df['Date'].min(),
+        end=df['Date'].max() + BDay(10)
+    )
+
+    def make_features(date):
+            return {
+                'dow':     date.weekday(),
+                'is_hol':  int(date in holidays),
+                'is_bday': int((date.weekday()<5) and date not in holidays),
+                'month':   date.month
+            }
+
+    records = []
+    for _, row in df.iterrows():
+        dt = row['Date']                   
+        base = {'fte': row['FTE_Students']}
+        base.update(make_features(dt))
+        records.append(base)
+    feat_df = pd.DataFrame(records, index=df['Date'])
+
+
+    X, y = build_features(df)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, shuffle=False
+    )
+
+    search_results = hyperparameter_search(X_train, y_train)
+
+    best_rf = search_results['rf'].best_estimator_
+    print("RF best params:", search_results['rf'].best_params_)
+    evaluate_and_diagnose(best_rf, X_test, y_test, model_name="RandomForest")
+
+    best_xgb = search_results['xgb'].best_estimator_
+    print("XGB best params:", search_results['xgb'].best_params_)
+    evaluate_and_diagnose(best_xgb, X_test, y_test, model_name="XGBoost")
+
+    seq_len = 7
+    ts = df.groupby('Date')['TotalDurationHours'].sum().sort_index().values
+
+    scaler = MinMaxScaler()
+    ts_scaled = scaler.fit_transform(ts.reshape(-1,1)).ravel()
+
+    X_seq = np.array([ts_scaled[i:i+seq_len] for i in range(len(ts_scaled) - seq_len)])
+    y_seq = ts_scaled[seq_len:]
+
+    X_seq = X_seq.reshape(-1, seq_len, 1)
+
+    split_idx = int(len(X_seq) * 0.8)
+    seq_X_train, seq_X_test = X_seq[:split_idx], X_seq[split_idx:]
+    seq_y_train, seq_y_test = y_seq[:split_idx], y_seq[split_idx:]
+
+    rnn_model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=(seq_len,1)),
+        LSTM(32),
+        Dropout(0.1),
+        Dense(1)
+    ])
+    rnn_model.compile(optimizer=Adam(0.001), loss='mae')
+
+    es = EarlyStopping(patience=5, restore_best_weights=True)
+    mc = ModelCheckpoint(os.path.join(BASE_DIR, "models", "rnn_best.h5"),
+                         save_best_only=True)
+    rnn_model.fit(seq_X_train, seq_y_train,
+                  epochs=50, batch_size=16,
+                  validation_split=0.1,
+                  callbacks=[es, mc],
+                  verbose=0)
+
+    y_pred_scaled = rnn_model.predict(seq_X_test)
+
+    y_pred_raw  = scaler.inverse_transform(y_pred_scaled).ravel()
+    y_test_raw  = scaler.inverse_transform(seq_y_test.reshape(-1,1)).ravel()
+
+    mae_hours = mean_absolute_error(y_test_raw, y_pred_raw)
+    print(f"RNN MAE (hours): {mae_hours:.3f}")
+    evaluate_and_diagnose(rnn_model, seq_X_test, seq_y_test, model_name="RNN")
+
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['dow']      = df['Date'].dt.weekday
+    df['dow_name'] = df['Date'].dt.day_name()
+
+    # only Monday–Friday
+    biz = df[df['dow'] < 5]
+
+    typical = (
+        biz.groupby(['dow','dow_name','Place','Level'])['StaffRequired']
+           .mean()
+           .reset_index()
+           .pivot(
+              index='dow_name',
+              columns=['Place','Level'],
+              values='StaffRequired'
+           )
+           .reindex(['Monday','Tuesday','Wednesday','Thursday','Friday'])
+    )
+
+    print("\nTypical staffing by day of week (3‑year avg):")
+    print(typical.round(2))   # rounded for readability
+
+    # ——— Next‑week forecast on business days ———
+    # 1) define a business‑day offset that skips US federal holidays
+    cal  = USFederalHolidayCalendar()
+    cbd  = CustomBusinessDay(calendar=cal)
+
+    today = pd.to_datetime(datetime.now().date())
+    # start tomorrow’s first business day
+    first_bd = today + cbd
+    next7_bd = pd.date_range(first_bd, periods=7, freq=cbd)
+
+    detailed = []
+    for place in df['Place'].unique():
+        for lvl in df['Level'].dropna().unique():
+            sub = df[(df['Place']==place)&(df['Level']==lvl)]
+            if len(sub) < seq_len: continue
+
+            ts = sub.groupby('Date')['TotalDurationHours'].sum().sort_index().values
+            scaler_pl = MinMaxScaler()
+            s_ts      = scaler_pl.fit_transform(ts.reshape(-1,1)).ravel()
+
+            window = s_ts[-seq_len:].copy()
+            fc_s   = []
+            for _ in range(7):
+                nxt = rnn_model.predict(window.reshape(1,seq_len,1)).ravel()[0]
+                fc_s.append(nxt)
+                window = np.roll(window, -1); window[-1] = nxt
+
+            fc_h = scaler_pl.inverse_transform(np.array(fc_s).reshape(-1,1)).ravel()
+
+            # **correct** staff calculation:
+            staff_ratio = level_ratio[lvl]
+            fte_students = fc_h / 9
+            fc_st        = np.ceil(fte_students / staff_ratio).astype(int)
+
+            detailed.append(pd.DataFrame({
+                'Place':         place,
+                'Level':         lvl,
+                'Date':          next7_bd,
+                'ForecastHours': fc_h,
+                'StaffRequired': fc_st
+            }))
+    detailed_df = pd.concat(detailed, ignore_index=True)
+
+    print(f"\nNext‑week staffing forecast (business days starting {next7_bd[0].date()}):")
+    print(
+      detailed_df
+        .pivot_table(
+          index='Date', columns=['Place','Level'], values='StaffRequired'
+        )
+        .fillna(0).astype(int)
+    )
+
+if __name__ == '__main__':
+    main()
