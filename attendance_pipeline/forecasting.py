@@ -45,7 +45,6 @@ def compute_typical_staffing(df: pd.DataFrame) -> pd.DataFrame:
         .reindex(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'])
     )
 
-    # apply ratio and ceil
     staff_df = fte_pivot.copy()
     for place, level in staff_df.columns:
         ratio = students_per_staff.get(level, 1)
@@ -83,7 +82,6 @@ def forecast_staff_by_group(
         .astype(int)
     )
 
-    # Determine training end
     if start_date is None:
         train_end = df_bd.Date.max()
     else:
@@ -98,18 +96,15 @@ def forecast_staff_by_group(
         sub_train = sub[sub.Date <= train_end]
         daily_hours = sub_train.groupby('Date')['TotalDurationHours'].sum()
 
-        # fit scaler on true data only
         scaler = StandardScaler()
         scaler.fit(daily_hours.values.reshape(-1,1))
 
-        # reindex to full BD index, fill zeros
         ts_full = daily_hours.reindex(bd_index, fill_value=0)
         ts_scaled = scaler.transform(ts_full.values.reshape(-1,1)).ravel()
 
         if len(ts_scaled) < seq_len+1:
             continue
 
-        # build sequences
         X, y = [], []
         for i in range(len(ts_scaled)-seq_len):
             X.append(ts_scaled[i:i+seq_len])
@@ -117,7 +112,6 @@ def forecast_staff_by_group(
         X = np.array(X).reshape(-1,seq_len,1)
         y = np.array(y)
 
-        # train LSTM
         model = Sequential([
             LSTM(64, return_sequences=True, input_shape=(seq_len,1)),
             LSTM(32),
@@ -128,14 +122,12 @@ def forecast_staff_by_group(
         model.fit(X, y, epochs=epochs, batch_size=batch,
                   validation_split=0.1, verbose=0)
 
-        # figure out level *before* logging
         level = get_level_from_room(assigned_room, place)
         fn = f"lstm_{place.replace(' ','_')}_{assigned_room.replace(' ','_')}.h5"
         model.save(os.path.join(MODELS_DIR, fn))
         logger.info("Saved LSTM model for %s – %s (Level=%s) → %s",
                     place, assigned_room, level, fn)
 
-        # forecast
         window = ts_scaled[-seq_len:].copy()
         future_dates = pd.date_range(train_end + cbd, periods=horizon, freq=cbd)
         fc_scaled = []

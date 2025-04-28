@@ -74,11 +74,9 @@ def parse_and_aggregate_attendance(force_refresh: bool = False) -> pd.DataFrame:
             for _, row in df.iterrows():
                 ins_list  = parse_event(row.get(col_in, ""))
                 outs_list = parse_event(row.get(col_out, ""))
-                # skip rows without matching in/out lengths
                 if not ins_list or not outs_list:
                     continue
 
-                # iterate each sign-in / sign-out pair
                 for (time_in, _, room_in), (time_out, _, _) in zip(ins_list, outs_list):
                     dt_in  = combine_date_time(date_obj, time_in)
                     dt_out = combine_date_time(date_obj, time_out)
@@ -86,7 +84,6 @@ def parse_and_aggregate_attendance(force_refresh: bool = False) -> pd.DataFrame:
                         continue
 
                     duration = (dt_out - dt_in).total_seconds() / 3600
-                    # now each session uses its own room_in
                     assigned = room_in if place == 'ECEC' else row.get('AssignedRoom','')
                     records.append({
                         'StudentID':     row.get('StudentID',''),
